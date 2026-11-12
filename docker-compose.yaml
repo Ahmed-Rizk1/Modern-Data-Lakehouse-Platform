@@ -1,0 +1,297 @@
+x-minio-aws-env: &minio-aws-env
+  AWS_ACCESS_KEY_ID: ${MINIO_ROOT_USER}
+  AWS_SECRET_ACCESS_KEY: ${MINIO_ROOT_PASSWORD}
+  AWS_REGION: us-east-1
+  AWS_DEFAULT_REGION: us-east-1
+  MINIO_REGION: us-east-1
+
+services:
+  # --------------------------------------------
+  #           Traefik Load Balancer & Gateway
+  # --------------------------------------------
+  traefik:
+    container_name: traefik
+    image: ${TRAEFIK_IMAGE}
+    command:
+      - "--api.insecure=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--serversTransport.insecureSkipVerify=true"
+    ports:
+      - "80:80"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      - lakehouse
+
+  # --------------------------------------------
+  #           MinIO Distributed Object Storage
+  # --------------------------------------------
+  minio:
+    image: ${MINIO_IMAGE}
+    container_name: minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_DOMAIN: ${MINIO_DOMAIN}
+    ports:
+      - "9001:9001"
+      - "9000:9000"
+    command: ["server", "/data", "--console-address", ":9001"]
+    volumes:
+      - ./volumes/minio:/data
+    networks:
+      lakehouse:
+        aliases:
+          - ${WAREHOUSE_BUCKET_NAME}.minio
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.minio.entrypoints=web"
+      - "traefik.http.routers.minio.rule=Host(`minio.${DOMAIN}`)"
+      - "traefik.http.services.minio.loadbalancer.server.port=9001"
+      - "traefik.http.services.minio.loadbalancer.server.scheme=http"
+
+  # --------------------------------------------
+  #   PostgreSQL (Catalog DB & Prefect Backend)
+  # --------------------------------------------
+  postgres:
+    image: ${POSTGRES_IMAGE}
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pg_data
+      POSTGRES_HOST_AUTH_METHOD: trust
+    volumes:
+      - ./volumes/postgres:/var/lib/postgresql/data/pg_data
+    networks:
+      - lakehouse
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # --------------------------------------------
+  #            Apache Iceberg REST Catalog
+  # --------------------------------------------
+  iceberg:
+    image: ${REST_CATALOG_IMAGE}
+    container_name: iceberg-rest
+    ports:
+      - "8181:8181"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    environment:
+      << : [ *minio-aws-env ]
+      CATALOG_WAREHOUSE: s3://${WAREHOUSE_BUCKET_NAME}/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_URI: jdbc:postgresql://postgres:5432/${ICEBERG_CATALOG_DB}
+      CATALOG_JDBC_USER: ${POSTGRES_USER}
+      CATALOG_JDBC_PASSWORD: ${POSTGRES_PASSWORD}
+      REST_PORT: 8181
+    networks:
+      - lakehouse
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8181/v1/config || wget -qO- http://localhost:8181/v1/config || nc -z localhost 8181 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # --------------------------------------------
+  #          Trino Distributed SQL Engine
+  # --------------------------------------------
+  trino:
+    container_name: trino
+    image: ${TRINO_IMAGE}
+    ports:
+      - "8080:8080"
+    depends_on:
+      iceberg:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./volumes/config/trino-catalog.properties:/etc/trino/catalog/${CATALOG_NAME}.properties
+    networks:
+      - lakehouse
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/v1/info || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 25s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.trino.entrypoints=web"
+      - "traefik.http.routers.trino.rule=Host(`trino.${DOMAIN}`)"
+      - "traefik.http.services.trino.loadbalancer.server.port=8080"
+      - "traefik.http.services.trino.loadbalancer.server.scheme=http"
+
+  # --------------------------------------------
+  #            Apache Superset BI Analytics
+  # --------------------------------------------
+  superset:
+    container_name: superset
+    image: ${SUPERSET_IMAGE}
+    ports:
+      - "8088:8088"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      trino:
+        condition: service_healthy
+    environment:
+      ADMIN_USERNAME: admin
+      ADMIN_EMAIL: admin@superset.com
+      ADMIN_PASSWORD: admin
+      SUPERSET_CONFIG_PATH: /app/superset_config.py
+    volumes:
+      - ./config/superset_config.py:/app/superset_config.py
+      - ./data:${LAKEHOUSE_DATA_PATH}
+    networks:
+      - lakehouse
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8088/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 35s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.superset.entrypoints=web"
+      - "traefik.http.routers.superset.rule=Host(`superset.${DOMAIN}`)"
+      - "traefik.http.services.superset.loadbalancer.server.port=8088"
+      - "traefik.http.services.superset.loadbalancer.server.scheme=http"
+
+  # --------------------------------------------
+  #                 Jupyter Lab
+  # --------------------------------------------
+  jupyter:
+    container_name: jupyter
+    image: ${JUPYTER_IMAGE}
+    ports:
+      - "5006:5006"
+    depends_on:
+      iceberg:
+        condition: service_healthy
+      trino:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      prefect-server:
+        condition: service_healthy
+    volumes:
+      - ${SPARK_DEFAULTS_CONFIG}:/opt/spark/conf/spark-defaults.conf
+      - ${PYICEBERG_CONFIG}:/root/.pyiceberg.yaml
+      - ./volumes/jupyter/ivy2:/root/.ivy2
+      - ./data:${LAKEHOUSE_DATA_PATH}
+    entrypoint: [
+      "jupyter", "lab", "--ip=0.0.0.0", "--port=5006", "--no-browser", "--allow-root",
+      "--NotebookApp.notebook_dir='${LAKEHOUSE_DATA_PATH}'", "--NotebookApp.token=''"
+    ]
+    environment:
+      << : [ *minio-aws-env ]
+      PYTHONPATH: ${LAKEHOUSE_DATA_PATH}/scripts:${LAKEHOUSE_DATA_PATH}/pipelines
+      LAKEHOUSE_DATA_PATH: ${LAKEHOUSE_DATA_PATH}
+      CATALOG_NAME: ${CATALOG_NAME}
+    networks:
+      - lakehouse
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.jupyter.entrypoints=web"
+      - "traefik.http.routers.jupyter.rule=Host(`jupyter.${DOMAIN}`)"
+      - "traefik.http.services.jupyter.loadbalancer.server.port=5006"
+      - "traefik.http.services.jupyter.loadbalancer.server.scheme=http"
+
+  # --------------------------------------------
+  #         Prefect Server (State & API)
+  # --------------------------------------------
+  prefect-server:
+    container_name: prefect-server
+    image: ${PREFECT_IMAGE}
+    command: >
+      bash -c "prefect server start"
+    ports:
+      - "4200:4200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./volumes/prefect:/root/.prefect
+      - ./data:${LAKEHOUSE_DATA_PATH}
+    environment:
+      PREFECT_SERVER_API_HOST: 0.0.0.0
+      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${PREFECT_DATABASE}
+      PREFECT_SERVER_ANALYTICS_ENABLED: "false"
+      PREFECT_LOGGING_SERVER_LEVEL: WARNING
+      PREFECT_API_URL: http://${HOST_OR_IP}:4200/api
+    networks:
+      - lakehouse
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:4200/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.prefect.entrypoints=web"
+      - "traefik.http.routers.prefect.rule=Host(`prefect.${DOMAIN}`)"
+      - "traefik.http.services.prefect.loadbalancer.server.port=4200"
+      - "traefik.http.services.prefect.loadbalancer.server.scheme=http"
+
+  # --------------------------------------------
+  #       Prefect Worker (Pipeline Execution)
+  # --------------------------------------------
+  prefect-worker:
+    container_name: prefect-worker
+    image: ${INGESTION_IMAGE}
+    command:
+      - prefect
+      - worker
+      - start
+      - --pool
+      - ${PREFECT_WORKER_POOL}
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+      iceberg:
+        condition: service_healthy
+      trino:
+        condition: service_healthy
+    environment:
+      PREFECT_API_URL: http://${HOST_OR_IP}:4200/api
+      PREFECT_LOGGING_LEVEL: INFO
+      DOCKER_HOST: unix://var/run/docker.sock
+      PYTHONPATH: ${LAKEHOUSE_DATA_PATH}/scripts:${LAKEHOUSE_DATA_PATH}/pipelines
+      LAKEHOUSE_DATA_PATH: ${LAKEHOUSE_DATA_PATH}
+      CATALOG_NAME: ${CATALOG_NAME}
+      TRINO_HOST: trino
+      TRINO_PORT: 8080
+      TRINO_USER: lakehouse
+    volumes:
+      - ./data:${LAKEHOUSE_DATA_PATH}
+      - ${PYICEBERG_CONFIG}:/root/.pyiceberg.yaml
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - lakehouse
+
+networks:
+  lakehouse:
+    name: lakehouse
